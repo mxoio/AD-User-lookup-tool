@@ -1,4 +1,4 @@
-# check_lastlogin.ps1
+# check_user.ps1
 # Check if Active Directory module is available
 if (!(Get-Module -ListAvailable -Name ActiveDirectory)) {
     Write-Host "ERROR: Active Directory module not found. Please install RSAT tools." -ForegroundColor Red
