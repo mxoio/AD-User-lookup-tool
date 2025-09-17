@@ -116,10 +116,11 @@ function Show-MainMenu {
     Write-Host "REPORTS" -ForegroundColor Yellow
     Write-Host "  6.  Locked Out Accounts"
     Write-Host "  7.  Password Expiry Report"
-    Write-Host "  8.  Export User List"
+    Write-Host "  8.  Inactive Users Report (60/120+ days)"
+    Write-Host "  9.  Export User List"
     Write-Host ""
     Write-Host "SYSTEM" -ForegroundColor Yellow
-    Write-Host "  9.  Settings"
+    Write-Host "  10. Settings"
     Write-Host "  H.  Help"
     Write-Host "  Q.  Quit"
     Write-Host ""
@@ -342,7 +343,165 @@ function Get-PasswordExpiryReport {
     }
 }
 
-# 8. Export User List
+# 8. Inactive Users Report
+function Get-InactiveUsersReport {
+    Write-Host "`n=== INACTIVE USERS REPORT ===" -ForegroundColor Cyan
+    Write-Host "This will check all users against all domain controllers for accurate results." -ForegroundColor Gray
+    Write-Host "This may take a few minutes depending on the number of users and DCs..." -ForegroundColor Gray
+    
+    try {
+        # Get all DCs once
+        $dcs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty Name
+        Write-Host "`nFound $($dcs.Count) domain controller(s)" -ForegroundColor Gray
+        
+        # Get all enabled users
+        $users = Get-ADUser -Filter {Enabled -eq $true} -Properties DisplayName, Department, Title, EmailAddress
+        Write-Host "Checking $($users.Count) enabled users..." -ForegroundColor Gray
+        
+        $inactiveUsers60 = @()
+        $inactiveUsers120 = @()
+        $neverLoggedIn = @()
+        $processedCount = 0
+        
+        foreach ($user in $users) {
+            $processedCount++
+            Write-Progress -Activity "Checking user logons" -Status "$($user.SamAccountName)" -PercentComplete (($processedCount / $users.Count) * 100)
+            
+            # Get accurate last logon from all DCs
+            $lastLogonTime = 0
+            $lastLogonDC = ""
+            
+            foreach ($dc in $dcs) {
+                try {
+                    $dcUser = Get-ADUser $user.SamAccountName -Server $dc -Properties LastLogon -ErrorAction Stop
+                    if ($dcUser.LastLogon -gt $lastLogonTime) {
+                        $lastLogonTime = $dcUser.LastLogon
+                        $lastLogonDC = $dc
+                    }
+                }
+                catch {
+                    # DC unreachable, continue
+                }
+            }
+            
+            if ($lastLogonTime -eq 0) {
+                # User has never logged in
+                $neverLoggedIn += [PSCustomObject]@{
+                    Username = $user.SamAccountName
+                    DisplayName = $user.DisplayName
+                    Department = $user.Department
+                    Title = $user.Title
+                    Email = $user.EmailAddress
+                    LastLogon = "Never"
+                    DaysInactive = "N/A"
+                }
+            }
+            else {
+                $lastLogonDate = [DateTime]::FromFileTime($lastLogonTime)
+                $daysSinceLogon = (New-TimeSpan -Start $lastLogonDate -End (Get-Date)).Days
+                
+                if ($daysSinceLogon -ge 120) {
+                    $inactiveUsers120 += [PSCustomObject]@{
+                        Username = $user.SamAccountName
+                        DisplayName = $user.DisplayName
+                        Department = $user.Department
+                        Title = $user.Title
+                        Email = $user.EmailAddress
+                        LastLogon = $lastLogonDate.ToString('MM/dd/yyyy')
+                        DaysInactive = $daysSinceLogon
+                    }
+                }
+                elseif ($daysSinceLogon -ge 60) {
+                    $inactiveUsers60 += [PSCustomObject]@{
+                        Username = $user.SamAccountName
+                        DisplayName = $user.DisplayName
+                        Department = $user.Department
+                        Title = $user.Title
+                        Email = $user.EmailAddress
+                        LastLogon = $lastLogonDate.ToString('MM/dd/yyyy')
+                        DaysInactive = $daysSinceLogon
+                    }
+                }
+            }
+        }
+        
+        Write-Progress -Activity "Checking user logons" -Completed
+        
+        # Display results
+        Write-Host "`n========================================" -ForegroundColor Cyan
+        Write-Host "           INACTIVE USERS SUMMARY" -ForegroundColor Cyan
+        Write-Host "========================================" -ForegroundColor Cyan
+        
+        Write-Host "`nNever Logged In: $($neverLoggedIn.Count) users" -ForegroundColor Red
+        if ($neverLoggedIn.Count -gt 0 -and $neverLoggedIn.Count -le 10) {
+            $neverLoggedIn | Format-Table Username, DisplayName, Department -AutoSize
+        }
+        elseif ($neverLoggedIn.Count -gt 10) {
+            Write-Host "  (Showing first 10 of $($neverLoggedIn.Count) users)" -ForegroundColor Gray
+            $neverLoggedIn | Select-Object -First 10 | Format-Table Username, DisplayName, Department -AutoSize
+        }
+        
+        Write-Host "`nInactive 120+ Days: $($inactiveUsers120.Count) users" -ForegroundColor Red
+        if ($inactiveUsers120.Count -gt 0 -and $inactiveUsers120.Count -le 10) {
+            $inactiveUsers120 | Sort-Object DaysInactive -Descending | Format-Table Username, DisplayName, LastLogon, DaysInactive -AutoSize
+        }
+        elseif ($inactiveUsers120.Count -gt 10) {
+            Write-Host "  (Showing first 10 of $($inactiveUsers120.Count) users)" -ForegroundColor Gray
+            $inactiveUsers120 | Sort-Object DaysInactive -Descending | Select-Object -First 10 | Format-Table Username, DisplayName, LastLogon, DaysInactive -AutoSize
+        }
+        
+        Write-Host "`nInactive 60-119 Days: $($inactiveUsers60.Count) users" -ForegroundColor Yellow
+        if ($inactiveUsers60.Count -gt 0 -and $inactiveUsers60.Count -le 10) {
+            $inactiveUsers60 | Sort-Object DaysInactive -Descending | Format-Table Username, DisplayName, LastLogon, DaysInactive -AutoSize
+        }
+        elseif ($inactiveUsers60.Count -gt 10) {
+            Write-Host "  (Showing first 10 of $($inactiveUsers60.Count) users)" -ForegroundColor Gray
+            $inactiveUsers60 | Sort-Object DaysInactive -Descending | Select-Object -First 10 | Format-Table Username, DisplayName, LastLogon, DaysInactive -AutoSize
+        }
+        
+        # Export option
+        if (($inactiveUsers60.Count + $inactiveUsers120.Count + $neverLoggedIn.Count) -gt 0) {
+            $export = Read-Host "`nExport full results to CSV? (Y/N)"
+            if ($export -eq 'Y') {
+                $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+                $exportPath = $Script:Config.ExportPath
+                
+                if (!(Test-Path $exportPath)) {
+                    New-Item -ItemType Directory -Path $exportPath -Force | Out-Null
+                }
+                
+                # Export each category
+                if ($neverLoggedIn.Count -gt 0) {
+                    $neverLoggedIn | Export-Csv -Path (Join-Path $exportPath "NeverLoggedIn_$timestamp.csv") -NoTypeInformation
+                    Write-Host "Exported never logged in users" -ForegroundColor Green
+                }
+                if ($inactiveUsers120.Count -gt 0) {
+                    $inactiveUsers120 | Export-Csv -Path (Join-Path $exportPath "Inactive120Days_$timestamp.csv") -NoTypeInformation
+                    Write-Host "Exported 120+ days inactive users" -ForegroundColor Green
+                }
+                if ($inactiveUsers60.Count -gt 0) {
+                    $inactiveUsers60 | Export-Csv -Path (Join-Path $exportPath "Inactive60Days_$timestamp.csv") -NoTypeInformation
+                    Write-Host "Exported 60+ days inactive users" -ForegroundColor Green
+                }
+                
+                # Combined export
+                $allInactive = @()
+                $allInactive += $neverLoggedIn
+                $allInactive += $inactiveUsers120
+                $allInactive += $inactiveUsers60
+                $allInactive | Export-Csv -Path (Join-Path $exportPath "AllInactiveUsers_$timestamp.csv") -NoTypeInformation
+                Write-Host "Exported combined report to: $exportPath" -ForegroundColor Green
+            }
+        }
+        
+        Write-Host "`nTotal inactive users: $(($inactiveUsers60.Count + $inactiveUsers120.Count + $neverLoggedIn.Count))" -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "Error generating inactive users report: $_" -ForegroundColor Red
+    }
+}
+
+# 9. Export User List
 function Export-UserList {
     Write-Host "`n=== EXPORT USER LIST ===" -ForegroundColor Cyan
     
@@ -367,7 +526,7 @@ function Export-UserList {
     }
 }
 
-# 9. Settings
+# 10. Settings
 function Show-Settings {
     Write-Host "`n=== SETTINGS ===" -ForegroundColor Cyan
     Write-Host "Current Settings:" -ForegroundColor Yellow
@@ -377,7 +536,7 @@ function Show-Settings {
     Write-Host ""
 }
 
-# 10. Help
+# 11. Help
 function Show-Help {
     Write-Host "`n=== HELP ===" -ForegroundColor Cyan
     Write-Host ""
@@ -416,8 +575,9 @@ do {
         "5" { Toggle-UserAccount; Read-Host "`nPress Enter to continue" }
         "6" { Get-LockedOutAccounts; Read-Host "`nPress Enter to continue" }
         "7" { Get-PasswordExpiryReport; Read-Host "`nPress Enter to continue" }
-        "8" { Export-UserList; Read-Host "`nPress Enter to continue" }
-        "9" { Show-Settings; Read-Host "`nPress Enter to continue" }
+        "8" { Get-InactiveUsersReport; Read-Host "`nPress Enter to continue" }
+        "9" { Export-UserList; Read-Host "`nPress Enter to continue" }
+        "10" { Show-Settings; Read-Host "`nPress Enter to continue" }
         "H" { Show-Help; Read-Host "`nPress Enter to continue" }
         "h" { Show-Help; Read-Host "`nPress Enter to continue" }
         "Q" { Write-Host "`nExiting..." -ForegroundColor Yellow }
