@@ -1,16 +1,8 @@
-# AD Management Tool v3.0 — Single-File Edition
-# SECTION 1/8 — Core / Globals / Init
+# AD Management Tool - Section 1 of 8 (Core Functions) - REPLACEMENT
+# Save as: ADTool-Section1.ps1
 
 #Requires -Version 5.0
 #Requires -Modules ActiveDirectory
-
-param(
-    [string]$ModulePath = $PSScriptRoot,
-    [switch]$SkipInitCheck
-)
-
-# Single-file mode flag
-$Script:IsSingleFile = $true
 
 # Global configuration
 $Script:Config = @{
@@ -71,44 +63,106 @@ function Initialize-ADTool {
     }
 }
 
+# NEW: Get accurate (non-replicated) lastLogon across all DCs
+function Get-ADLastLogonAcrossDCs {
+    param(
+        [ValidateSet('User','Computer')][string]$ObjectClass,
+        [Parameter(Mandatory)][string]$Identity
+    )
+
+    $latest  = $null
+    $sourceDc = $null
+
+    $dcs = Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
+    foreach ($dc in $dcs) {
+        try {
+            $obj = if ($ObjectClass -eq 'User') {
+                Get-ADUser -Identity $Identity -Server $dc -Properties lastLogon -ErrorAction Stop
+            } else {
+                Get-ADComputer -Identity $Identity -Server $dc -Properties lastLogon -ErrorAction Stop
+            }
+
+            if ($obj.lastLogon -and $obj.lastLogon -gt 0) {
+                $dt = [DateTime]::FromFileTime($obj.lastLogon)
+                if (-not $latest -or $dt -gt $latest) {
+                    $latest  = $dt
+                    $sourceDc = $dc
+                }
+            }
+        } catch {
+            # ignore per-DC lookup errors so one bad DC doesn't kill the query
+        }
+    }
+
+    [PSCustomObject]@{
+        Date = $latest
+        DC   = $sourceDc
+    }
+}
+
 function Search-ADUsers {
     param(
         [string]$SearchTerm = '*',
         [switch]$IncludeDisabled,
-        [int]$MaxResults = 100
+        [int]$MaxResults = 100,
+        [switch]$Accurate
     )
 
     try {
         $enabledFilter = if ($IncludeDisabled) { "" } else { " -and Enabled -eq `$true" }
         $filter = "(Name -like '*$SearchTerm*' -or SamAccountName -like '*$SearchTerm*')$enabledFilter"
 
-        $users = Get-ADUser -Filter $filter -Properties DisplayName,mail,Department,Enabled,LastLogonDate |
-                 Select-Object -First $MaxResults
+        $raw = Get-ADUser -Filter $filter -Properties DisplayName,mail,Department,Enabled,LastLogonDate |
+               Select-Object -First $MaxResults
 
-        Write-ADLog "Found $($users.Count) users" -Level Success
-        return $users
+        if (-not $Accurate) {
+            Write-ADLog "Found $(@($raw).Count) users (approx dates)" -Level Success
+            return $raw
+        }
+
+        $results = foreach ($u in $raw) {
+            $acc = Get-ADLastLogonAcrossDCs -ObjectClass User -Identity $u.SamAccountName
+            [PSCustomObject]@{
+                Username              = $u.SamAccountName
+                DisplayName           = $u.DisplayName
+                Email                 = $u.mail
+                Department            = $u.Department
+                Enabled               = $u.Enabled
+                LastLogonDate         = $u.LastLogonDate
+                LastLogonDateAccurate = $acc.Date
+                LastLogonFromDC       = $acc.DC
+            }
+        }
+
+        Write-ADLog "Found $(@($results).Count) users (accurate dates)" -Level Success
+        return $results
+
     } catch {
         Write-ADLog "User search failed: $($_.Exception.Message)" -Level Error
         throw
     }
 }
 
+# UPDATED: includes accurate cross-DC last logon + source DC
 function Get-UserDetails {
     param([string]$Username)
 
     try {
-        $user   = Get-ADUser -Identity $Username -Properties *
-        $groups = Get-ADPrincipalGroupMembership -Identity $Username
+        $user     = Get-ADUser -Identity $Username -Properties *
+        $groups   = Get-ADPrincipalGroupMembership -Identity $Username
+        $accurate = Get-ADLastLogonAcrossDCs -ObjectClass User -Identity $Username
 
         return [PSCustomObject]@{
-            Username      = $user.SamAccountName
-            DisplayName   = $user.DisplayName
-            Email         = $user.mail
-            Department    = $user.Department
-            Enabled       = $user.Enabled
-            LockedOut     = $user.LockedOut
-            LastLogonDate = $user.LastLogonDate
-            Groups        = ($groups.Name -join ', ')
+            Username              = $user.SamAccountName
+            DisplayName           = $user.DisplayName
+            Email                 = $user.mail
+            Department            = $user.Department
+            Enabled               = $user.Enabled
+            LockedOut             = $user.LockedOut
+            LastLogonDate         = $user.LastLogonDate                 # replicated/approximate
+            LastLogonDateAccurate = $accurate.Date                      # precise, per-DC max
+            LastLogonFromDC       = $accurate.DC
+            Groups                = ($groups.Name -join ', ')
         }
     } catch {
         Write-ADLog "Failed to get user details: $($_.Exception.Message)" -Level Error
@@ -294,36 +348,65 @@ function Invoke-BulkUserOperation {
 }
 
 Write-ADLog "Section 2 loaded successfully" -Level Success
-# SECTION 3/8 — Computer Management
+# AD Management Tool - Section 3 of 8 (Computer Management) - UPDATED
+# Save as: ADTool-Section3.ps1
+
+# Prefer private LAN IPv4s over CGNAT/Tailscale/public when resolving hostnames
+function Resolve-PreferPrivateIPv4 {
+    param([string]$HostName)
+    try {
+        $ipv4s = [System.Net.Dns]::GetHostAddresses($HostName) |
+                 Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+        if (-not $ipv4s) { return $null }
+
+        $ranked = $ipv4s | Sort-Object -Property @{
+            Expression = {
+                $b = $_.GetAddressBytes()
+                if     ($b[0] -eq 192 -and $b[1] -eq 168)                         { 0 }   # 192.168.x.x
+                elseif ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31)        { 1 }   # 172.16–31.x.x
+                elseif ($b[0] -eq 10)                                             { 2 }   # 10.x.x.x
+                elseif ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127)       { 10 }  # 100.64/10 (CGNAT/Tailscale)
+                else                                                               { 5 }   # anything else
+            }
+        }
+        return $ranked[0].IPAddressToString
+    } catch { return $null }
+}
 
 function Search-ADComputers {
     param(
         [string]$SearchTerm = '*',
         [switch]$IncludeDisabled,
-        [int]$MaxResults = 100
+        [int]$MaxResults = 100,
+        [switch]$Accurate
     )
 
     try {
         $enabledFilter = if ($IncludeDisabled) { "" } else { " -and Enabled -eq `$true" }
         $filter = "(Name -like '*$SearchTerm*' -or DNSHostName -like '*$SearchTerm*')$enabledFilter"
 
-        $computers = Get-ADComputer -Filter $filter -Properties OperatingSystem,LastLogonTimestamp,Enabled,IPv4Address |
-                     Select-Object -First $MaxResults
+        $raw = Get-ADComputer -Filter $filter -Properties OperatingSystem,LastLogonTimestamp,Enabled,IPv4Address |
+               Select-Object -First $MaxResults
 
-        $results = foreach ($computer in $computers) {
-            $lastLogon = if ($computer.LastLogonTimestamp) { [DateTime]::FromFileTime($computer.LastLogonTimestamp) } else { $null }
+        $results = foreach ($c in $raw) {
+            $approx = if ($c.LastLogonTimestamp) { [DateTime]::FromFileTime($c.LastLogonTimestamp) } else { $null }
+            $acc    = if ($Accurate) { Get-ADLastLogonAcrossDCs -ObjectClass Computer -Identity $c.Name } else { $null }
+
             [PSCustomObject]@{
-                Name           = $computer.Name
-                DNSHostName    = $computer.DNSHostName
-                OperatingSystem= $computer.OperatingSystem
-                Enabled        = $computer.Enabled
-                IPv4Address    = $computer.IPv4Address
-                LastLogonDate  = $lastLogon
-                DaysSinceLogon = if ($lastLogon) { [int]((Get-Date) - $lastLogon).TotalDays } else { 'Never' }
+                Name                    = $c.Name
+                DNSHostName             = $c.DNSHostName
+                OperatingSystem         = $c.OperatingSystem
+                Enabled                 = $c.Enabled
+                IPv4Address             = $c.IPv4Address                        # AD attribute (may be stale)
+                ResolvedIPv4            = if ($c.DNSHostName) { Resolve-PreferPrivateIPv4 $c.DNSHostName } else { $null }
+                LastLogonDate           = $approx                                # replicated/approx
+                AccurateLastLogonDate   = if ($Accurate) { $acc.Date } else { $null }
+                AccurateLastLogonFromDC = if ($Accurate) { $acc.DC }   else { $null }
+                DaysSinceLogon          = if ($approx) { [int]((Get-Date) - $approx).TotalDays } else { 'Never' }
             }
         }
 
-        Write-ADLog "Found $($results.Count) computers" -Level Success
+        Write-ADLog "Found $(@($results).Count) computers$(@{ $true=' (accurate dates)'; $false='' }[$Accurate.IsPresent])" -Level Success
         return $results
 
     } catch {
@@ -337,39 +420,67 @@ function Get-ComputerDetails {
 
     try {
         $computer = Get-ADComputer -Identity $ComputerName -Properties *
-        $isOnline = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet
+        $isOnline = $false
+        try { $isOnline = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop } catch {}
 
+        # Accurate (non-replicated) last logon across DCs
+        $accurate = Get-ADLastLogonAcrossDCs -ObjectClass Computer -Identity $ComputerName
+
+        # Live DNS resolve with LAN preference
+        $resolvedIPv4 = if ($computer.DNSHostName) { Resolve-PreferPrivateIPv4 $computer.DNSHostName } else { $null }
+
+        # LiveInfo via CIM with WMI fallback
         $liveInfo = if ($isOnline) {
+            $info = $null
             try {
-                $cs = Get-CimInstance -ClassName Win32_ComputerSystem   -ComputerName $ComputerName -ErrorAction Stop
-                $os = Get-CimInstance -ClassName Win32_OperatingSystem  -ComputerName $ComputerName -ErrorAction Stop
-                @{
-                    LoggedOnUser   = $cs.UserName
-                    Manufacturer   = $cs.Manufacturer
-                    Model          = $cs.Model
-                    TotalMemoryGB  = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
-                    LastBootTime   = $os.LastBootUpTime
-                    UptimeDays     = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 2)
+                $cs = Get-CimInstance -ClassName Win32_ComputerSystem  -ComputerName $ComputerName -ErrorAction Stop
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
+                $info = @{
+                    LoggedOnUser  = $cs.UserName
+                    Manufacturer  = $cs.Manufacturer
+                    Model         = $cs.Model
+                    TotalMemoryGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+                    LastBootTime  = $os.LastBootUpTime
+                    UptimeDays    = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 2)
                 }
             } catch {
-                @{ Error = "WMI query failed" }
+                try {
+                    $cs = Get-WmiObject -Class Win32_ComputerSystem  -ComputerName $ComputerName -ErrorAction Stop
+                    $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop
+                    $info = @{
+                        LoggedOnUser  = $cs.UserName
+                        Manufacturer  = $cs.Manufacturer
+                        Model         = $cs.Model
+                        TotalMemoryGB = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+                        LastBootTime  = $os.LastBootUpTime
+                        UptimeDays    = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 2)
+                    }
+                } catch {
+                    @{ Error = "Remote management (CIM/WMI) failed" }
+                }
             }
+            $info
         } else {
             @{ Status = "Computer not reachable" }
         }
 
+        $approx = if ($computer.LastLogonTimestamp) { [DateTime]::FromFileTime($computer.LastLogonTimestamp) } else { $null }
+
         return [PSCustomObject]@{
-            Name                = $computer.Name
-            DNSHostName         = $computer.DNSHostName
-            Description         = $computer.Description
-            OperatingSystem     = $computer.OperatingSystem
-            Enabled             = $computer.Enabled
-            IPv4Address         = $computer.IPv4Address
-            LastLogonTimestamp  = if ($computer.LastLogonTimestamp) { [DateTime]::FromFileTime($computer.LastLogonTimestamp) } else { $null }
-            Created             = $computer.whenCreated
-            Modified            = $computer.whenChanged
-            Online              = $isOnline
-            LiveInfo            = $liveInfo
+            Name                    = $computer.Name
+            DNSHostName             = $computer.DNSHostName
+            Description             = $computer.Description
+            OperatingSystem         = $computer.OperatingSystem
+            Enabled                 = $computer.Enabled
+            IPv4Address             = $computer.IPv4Address
+            ResolvedIPv4            = $resolvedIPv4
+            LastLogonTimestampDate  = $approx
+            AccurateLastLogonDate   = $accurate.Date
+            AccurateLastLogonFromDC = $accurate.DC
+            Created                 = $computer.whenCreated
+            Modified                = $computer.whenChanged
+            Online                  = $isOnline
+            LiveInfo                = $liveInfo
         }
 
     } catch {
@@ -386,12 +497,27 @@ function Test-ComputerConnectivity {
 
     Write-ADLog "Testing connectivity for $($ComputerNames.Count) computers" -Level Info
 
+    $supportsTimeout = (Get-Command Test-Connection).Parameters.Keys -contains 'TimeoutSeconds'
+
     $results = foreach ($computerName in $ComputerNames) {
         try {
-            $pingResult = Test-Connection -ComputerName $computerName -Count 1 -TimeoutSeconds $TimeoutSeconds -Quiet
+            $pingResult = $false
+            try {
+                if ($supportsTimeout) {
+                    $pingResult = Test-Connection -ComputerName $computerName -Count 1 -TimeoutSeconds $TimeoutSeconds -Quiet -ErrorAction Stop
+                } else {
+                    # PS 5.1: no TimeoutSeconds
+                    $pingResult = Test-Connection -ComputerName $computerName -Count 1 -Quiet -ErrorAction Stop
+                }
+            } catch {}
+
+            if (-not $pingResult) {
+                try { $pingResult = Test-NetConnection -ComputerName $computerName -InformationLevel Quiet -WarningAction SilentlyContinue } catch {}
+            }
+
             [PSCustomObject]@{
                 ComputerName = $computerName
-                Online       = $pingResult
+                Online       = [bool]$pingResult
                 Status       = if ($pingResult) { 'Reachable' } else { 'Unreachable' }
                 TestTime     = Get-Date
             }
@@ -419,16 +545,16 @@ function Get-StaleComputersReport {
         $computers  = Get-ADComputer -Filter {Enabled -eq $true} -Properties LastLogonTimestamp,OperatingSystem
 
         $staleComputers = foreach ($computer in $computers) {
-            $lastLogon = if ($computer.LastLogonTimestamp) { [DateTime]::FromFileTime($computer.LastLogonTimestamp) } else { $null }
-            $daysSinceLogon = if ($lastLogon) { [int]((Get-Date) - $lastLogon).TotalDays } else { $null }
+            $approx = if ($computer.LastLogonTimestamp) { [DateTime]::FromFileTime($computer.LastLogonTimestamp) } else { $null }
+            $days   = if ($approx) { [int]((Get-Date) - $approx).TotalDays } else { $null }
 
-            if (!$lastLogon -or $lastLogon -lt $cutoffDate) {
+            if (!$approx -or $approx -lt $cutoffDate) {
                 [PSCustomObject]@{
-                    Name           = $computer.Name
-                    OperatingSystem= $computer.OperatingSystem
-                    LastLogonDate  = $lastLogon
-                    DaysSinceLogon = if ($daysSinceLogon) { $daysSinceLogon } else { 'Never' }
-                    Status         = if (!$lastLogon) { 'Never Logged On' } else { 'Stale' }
+                    Name            = $computer.Name
+                    OperatingSystem = $computer.OperatingSystem
+                    LastLogonDate   = $approx
+                    DaysSinceLogon  = if ($days) { $days } else { 'Never' }
+                    Status          = if (!$approx) { 'Never Logged On' } else { 'Stale' }
                 }
             }
         }
@@ -444,6 +570,7 @@ function Get-StaleComputersReport {
 }
 
 Write-ADLog "Section 3 loaded successfully" -Level Success
+
 # SECTION 4/8 — Reporting
 
 function Get-LockedOutUsers {
@@ -871,7 +998,8 @@ function Invoke-BulkOperationFromCSV {
 }
 
 Write-ADLog "Section 5 loaded successfully" -Level Success
-# SECTION 6/8 — Menu / UI
+# AD Management Tool - Section 6 of 8 (Menu / UI) - UPDATED
+# Save as: ADTool-Section6.ps1
 
 function Show-MainMenu {
     Clear-Host
@@ -925,18 +1053,24 @@ function Invoke-MainMenuLoop {
 
         try {
             switch ($choice.ToUpper()) {
+
+                # Search Users (now with optional accurate last logon across DCs)
                 '1' {
                     $searchTerm = Read-Host "Enter search term (or * for all)"
                     $includeDisabled = (Read-Host "Include disabled users? (y/N)").ToLower() -eq 'y'
-                    $users = Search-ADUsers -SearchTerm $searchTerm -IncludeDisabled:$includeDisabled
+                    $accurate = (Read-Host "Use accurate last logon across all DCs? (slower) (y/N)").ToLower() -eq 'y'
+
+                    $users = Search-ADUsers -SearchTerm $searchTerm -IncludeDisabled:$includeDisabled -Accurate:$accurate
                     Show-ReportSummary -Data $users -ReportName "User Search Results"
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '2' {
                     $username = Read-Host "Enter username"
                     if ($username) { Get-UserDetails -Username $username | Format-List }
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '3' {
                     $username = Read-Host "Enter username"
                     if ($username) {
@@ -946,11 +1080,13 @@ function Invoke-MainMenuLoop {
                     }
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '4' {
                     $username = Read-Host "Enter username"
                     if ($username) { Unlock-ADUserAccount -Username $username }
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '5' {
                     $username = Read-Host "Enter username"
                     if ($username) {
@@ -959,28 +1095,35 @@ function Invoke-MainMenuLoop {
                     }
                     Read-Host "`nPress Enter to continue"
                 }
+
+                # Search Computers (now with optional accurate last logon + private-IP preference)
                 '6' {
                     $searchTerm = Read-Host "Enter computer search term (or * for all)"
                     $includeDisabled = (Read-Host "Include disabled computers? (y/N)").ToLower() -eq 'y'
-                    $computers = Search-ADComputers -SearchTerm $searchTerm -IncludeDisabled:$includeDisabled
+                    $accurate = (Read-Host "Use accurate last logon across all DCs? (slower) (y/N)").ToLower() -eq 'y'
+
+                    $computers = Search-ADComputers -SearchTerm $searchTerm -IncludeDisabled:$includeDisabled -Accurate:$accurate
                     Show-ReportSummary -Data $computers -ReportName "Computer Search Results"
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '7' {
                     $computerName = Read-Host "Enter computer name"
                     if ($computerName) { Get-ComputerDetails -ComputerName $computerName | Format-List }
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '8' {
                     $computerNames = Read-Host "Enter computer names (comma separated)"
                     if ($computerNames) {
-                        $names  = $computerNames -split ',' | ForEach-Object { $_.Trim() }
+                        $names   = $computerNames -split ',' | ForEach-Object { $_.Trim() }
                         $results = Test-ComputerConnectivity -ComputerNames $names
                         Show-ReportSummary -Data $results -ReportName "Connectivity Test Results"
                     }
                     Read-Host "`nPress Enter to continue"
                 }
-                '9'  { $results = Get-LockedOutUsers;            Show-ReportSummary -Data $results -ReportName "Locked Out Users"; Read-Host "`nPress Enter to continue" }
+
+                '9'  { $results = Get-LockedOutUsers;        Show-ReportSummary -Data $results -ReportName "Locked Out Users";        Read-Host "`nPress Enter to continue" }
                 '10' {
                     $days = Read-Host "Days threshold (default: 30)"; if (!$days -or $days -notmatch '^\d+$') { $days = 30 }
                     $results = Get-PasswordExpiryReport -DaysThreshold $days
@@ -993,7 +1136,7 @@ function Invoke-MainMenuLoop {
                     Show-ReportSummary -Data $results -ReportName "Inactive Users Report"
                     Read-Host "`nPress Enter to continue"
                 }
-                '12' { $results = Get-PrivilegedUsersReport;     Show-ReportSummary -Data $results -ReportName "Privileged Users Report"; Read-Host "`nPress Enter to continue" }
+                '12' { $results = Get-PrivilegedUsersReport; Show-ReportSummary -Data $results -ReportName "Privileged Users Report"; Read-Host "`nPress Enter to continue" }
                 '13' {
                     $days = Read-Host "Stale days threshold (default: 90)"; if (!$days -or $days -notmatch '^\d+$') { $days = 90 }
                     $results = Get-StaleComputersReport -InactiveDays $days
@@ -1023,6 +1166,7 @@ function Invoke-MainMenuLoop {
                     Write-Host "  Enabled Computers: $($healthReport.AccountCounts.EnabledComputers)"
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '15' {
                     Write-Host "`n=== BULK USER OPERATIONS ===" -ForegroundColor Cyan
                     Write-Host "1. Enable Users"
@@ -1042,6 +1186,7 @@ function Invoke-MainMenuLoop {
                     }
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '16' {
                     $csvPath = Read-Host "Enter CSV file path"
                     if ($csvPath -and (Test-Path $csvPath)) {
@@ -1053,10 +1198,12 @@ function Invoke-MainMenuLoop {
                     }
                     Read-Host "`nPress Enter to continue"
                 }
+
                 '17' { Show-Statistics; Read-Host "`nPress Enter to continue" }
                 '18' { Show-Settings;   Read-Host "`nPress Enter to continue" }
                 'H'  { Show-Help;       Read-Host "`nPress Enter to continue" }
                 'Q'  { Write-Host "`nExiting AD Management Tool..." -ForegroundColor Yellow; break }
+
                 default {
                     Write-Host "Invalid selection. Please try again." -ForegroundColor Red
                     Start-Sleep -Seconds 1
@@ -1071,6 +1218,7 @@ function Invoke-MainMenuLoop {
 }
 
 Write-ADLog "Section 6 loaded successfully" -Level Success
+
 # SECTION 7/8 — Settings / Help
 
 function Show-Statistics {
